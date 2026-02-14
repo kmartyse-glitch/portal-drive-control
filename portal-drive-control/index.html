@@ -1,0 +1,228 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PortalDrive Test Control</title>
+  <style>
+    body { background:#111; color:#0f0; font-family:monospace; margin:20px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; align-items:center; }
+    button { padding:10px 14px; font-size:16px; cursor:pointer; }
+    button:disabled { opacity:.4; cursor:not-allowed; }
+    #log { white-space:pre-wrap; background:#000; padding:10px; border:1px solid #0f0; height:320px; overflow:auto; }
+    .hint { color:#7CFF7C; opacity:.9; }
+  </style>
+</head>
+
+<body>
+<h2>PortalDrive – Test Control</h2>
+
+<div class="row">
+  <button id="btnConnect">🔌 Подключиться</button>
+  <button id="btnStopAll" disabled>🛑 STOP</button>
+  <span class="hint">Держи кнопку = едет. Отпустил = отправляем stop сразу (без ожидания watchdog).</span>
+</div>
+
+<div class="row">
+  <button class="ctrl" data-cmd="forward_start" disabled>⬆ Вперёд</button>
+  <button class="ctrl" data-cmd="back_start" disabled>⬇ Назад</button>
+  <button class="ctrl" data-cmd="left_start" disabled>⬅ Левая</button>
+  <button class="ctrl" data-cmd="right_start" disabled>➡ Правая</button>
+</div>
+
+<pre id="log"></pre>
+
+<!-- LiveKit UMD -->
+<script src="https://unpkg.com/livekit-client@2/dist/livekit-client.umd.js"></script>
+
+<script>
+  // === НАСТРОЙКИ ===
+  const LIVEKIT_URL = "wss://portaldrivemain-l93pd6cc.livekit.cloud";
+  const TOKEN_URL   = "https://token-ozqtgt3ylq-uc.a.run.app";
+
+  const ROOM = "pd_unjYr2_tb01";
+  const IDENTITY = "test_controller_" + Math.floor(Math.random() * 10000);
+
+  // === UI/LOG ===
+  const logEl = document.getElementById("log");
+  const log = (t) => {
+    logEl.textContent += t + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  let room = null;
+  let holdTimer = null;
+  let connecting = false;
+  let activeCmd = null;           // что сейчас "держим"
+  let stopBurstTimer = null;      // второй стоп на всякий
+
+  function setControlsEnabled(enabled) {
+    document.querySelectorAll(".ctrl").forEach(b => b.disabled = !enabled);
+    document.getElementById("btnStopAll").disabled = !enabled;
+  }
+
+  // === TOKEN ===
+  async function getToken() {
+    // ВАЖНО: роль controller, чтобы canPublish=true (DataChannel)
+    const url = `${TOKEN_URL}?room=${encodeURIComponent(ROOM)}&identity=${encodeURIComponent(IDENTITY)}&role=controller`;
+    const r = await fetch(url);
+
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("application/json")) {
+      const j = await r.json();
+      if (!j.token) throw new Error("token отсутствует в JSON ответе");
+      return j.token;
+    }
+
+    const txt = (await r.text()).trim();
+    if (txt.startsWith("{")) {
+      try {
+        const j = JSON.parse(txt);
+        if (j.token) return j.token;
+      } catch (_) {}
+    }
+    if (!txt) throw new Error("пустой ответ token сервиса");
+    return txt;
+  }
+
+  // === SEND: PLAIN STRING ===
+  function publishCmd(cmd) {
+    if (!room || !room.localParticipant) {
+      log("❌ publishCmd: нет room/localParticipant");
+      return;
+    }
+    const payload = new TextEncoder().encode(cmd);
+    try {
+      room.localParticipant.publishData(payload, { reliable: true });
+    } catch (e) {
+      log("❌ publishData error: " + (e?.message || e));
+    }
+  }
+
+  function stopNow(reason = "") {
+    // гасим повторялку
+    if (holdTimer) clearInterval(holdTimer);
+    holdTimer = null;
+    activeCmd = null;
+
+    // гасим возможный предыдущий burst
+    if (stopBurstTimer) clearTimeout(stopBurstTimer);
+    stopBurstTimer = null;
+
+    // Шлём стоп сразу + дубль через 100мс (устойчивее при дрожи/потере пакета)
+    publishCmd("stop");
+    log("SEND: stop" + (reason ? ` (${reason})` : ""));
+
+    stopBurstTimer = setTimeout(() => {
+      publishCmd("stop");
+      log("SEND: stop (burst2)");
+    }, 100);
+  }
+
+  function startHold(cmd) {
+    if (!room) { log("❌ Нет подключения к комнате"); return; }
+
+    // если держим другое — сначала стопнем
+    if (activeCmd && activeCmd !== cmd) stopNow("switch");
+
+    activeCmd = cmd;
+
+    if (holdTimer) clearInterval(holdTimer);
+    if (stopBurstTimer) { clearTimeout(stopBurstTimer); stopBurstTimer = null; }
+
+    const send = () => {
+      publishCmd(cmd);
+      log("SEND: " + cmd);
+    };
+
+    // сразу
+    send();
+    // и повторяем, пока держим
+    holdTimer = setInterval(send, 120);
+  }
+
+  function stopHold() {
+    // КЛЮЧ: не молчим — а стопаем сразу
+    stopNow("release");
+  }
+
+  async function connectLK() {
+    if (connecting) return;
+    connecting = true;
+
+    if (typeof LivekitClient === "undefined") {
+      log("❌ LivekitClient не загрузился. Проверь интернет / CDN.");
+      connecting = false;
+      return;
+    }
+
+    setControlsEnabled(false);
+    log("Получение токена...");
+
+    let token = "";
+    try {
+      token = await getToken();
+    } catch (e) {
+      log("❌ Ошибка получения токена: " + (e?.message || e));
+      connecting = false;
+      return;
+    }
+
+    log("Подключение к LiveKit как " + IDENTITY + " ...");
+    room = new LivekitClient.Room({ adaptiveStream: true, dynacast: true });
+
+    room.on("disconnected", () => {
+      log("⚠️ disconnected");
+      setControlsEnabled(false);
+      stopNow("disconnected");
+    });
+
+    try {
+      await room.connect(LIVEKIT_URL, token);
+      log("✅ Подключено к комнате: " + ROOM);
+      setControlsEnabled(true);
+    } catch (e) {
+      log("❌ Ошибка подключения: " + (e?.message || e));
+      room = null;
+      setControlsEnabled(false);
+    } finally {
+      connecting = false;
+    }
+  }
+
+  // === UI EVENTS ===
+  document.getElementById("btnConnect").addEventListener("click", connectLK);
+  document.getElementById("btnStopAll").addEventListener("click", () => stopNow("button"));
+
+  // pointer events = лучший кроссплатформенный вариант (мышь/тач/стилус)
+  document.querySelectorAll(".ctrl").forEach(btn => {
+    const cmd = btn.dataset.cmd;
+
+    btn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      btn.setPointerCapture?.(e.pointerId);
+      startHold(cmd);
+    });
+
+    btn.addEventListener("pointerup", (e) => {
+      e.preventDefault();
+      stopHold();
+    });
+
+    btn.addEventListener("pointercancel", (e) => {
+      e.preventDefault();
+      stopHold();
+    });
+
+    btn.addEventListener("pointerleave", (e) => {
+      // если палец/мышь ушли — тоже стоп
+      stopHold();
+    });
+  });
+
+  // Глобально: отпустил где угодно на странице — стоп
+  window.addEventListener("pointerup", stopHold);
+  window.addEventListener("pointercancel", stopHold);
+  window.addEventListener("blur", () => stopNow("blur"));
+</script>
+</body>
+</html>
